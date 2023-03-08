@@ -205,6 +205,7 @@ if OS_WIN32_MINGW
 smartd_SOURCES += \
         os_win32/daemon_win32.cpp \
         os_win32/daemon_win32.h \
+        os_win32/hpt.h \
         os_win32/popen_win32.cpp \
         os_win32/popen.h \
         os_win32/syslog_win32.cpp \

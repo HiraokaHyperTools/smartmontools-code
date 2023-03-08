@@ -84,8 +84,10 @@ INPUT                  =
 INPUT_ENCODING         = UTF-8
 FILE_PATTERNS          = dev*.h \
                          dev*.cpp \
-                         scsiata.cpp
-RECURSIVE              = NO
+                         scsiata.cpp \
+                         os_win32.cpp \
+                         hpt.h
+RECURSIVE              = YES
 EXCLUDE                = 
 EXCLUDE_SYMLINKS       = NO
 EXCLUDE_PATTERNS       = 

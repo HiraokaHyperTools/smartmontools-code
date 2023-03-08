@@ -60,6 +60,9 @@ extern unsigned char failuretest_permissive;
 // aacraid support
 #include "aacraid.h"
 
+// HPT experimental support
+#include "os_win32/hpt.h"
+
 #ifndef _WIN64
 #define SELECT_WIN_32_64(x32, x64) (x32)
 #else
@@ -4049,6 +4052,644 @@ bool win10_nvme_device::nvme_pass_through(const nvme_cmd_in & in, nvme_cmd_out &
   }
 }
 
+//////////////////////////////////////////////////////////////////////
+// win32_highpoint_common
+
+class win32_highpoint_common
+: virtual public /*extends*/ win_smart_device
+{
+public:
+  win32_highpoint_common()
+    : win_smart_device(never_called)
+    { }
+
+  /**
+   * Send a HPT HBA specific IOCTL_SCSI_MINIPORT ioctl request to this device.
+   * 
+   * @param code HPT_CTL_CODE. e.g. `HPT_IOCTL_CODE_GET_VERSION`
+   * @param ioctl_buffer entire buffer supplied to DeviceIoControl API
+   * @param ioctl_bufsiz entire buffer length
+   */
+  bool hpt_ioctl(unsigned code, IOCTL_HEADER * ioctl_buffer,
+    unsigned ioctl_bufsiz);
+
+  /**
+   * Query interface version to the device.
+   * 
+   * version:
+   * 
+   * - `0` if HPT HBA is not present.
+   * - `0x02010000` means version `2.1`.
+   * 
+   * @param [out] version 0x02010000 or such.
+   */
+  bool get_version(uint32_t & version);
+
+  /**
+   * Open scsi device.
+   * 
+   * @param n N of `\\.\ScsiN:`
+   */
+  bool open_scsi(int n);
+
+  /**
+   * Query one device (either physical or array) info.
+   * 
+   * @param device_id device id allocated by HBA
+   * @param out_buf info
+   */
+  bool get_device_info(uint32_t device_id, hpt::LOGICAL_DEVICE_INFO * out_buf);
+
+  /**
+   * Query one controller info.
+   * 
+   * @param controller_id local controller number (1, 2, 3, ...)
+   * @param out_buf info
+   */
+  bool get_controller_info_v2(uint32_t controller_id, hpt::CONTROLLER_INFO_V2 * out_buf);
+
+  /**
+   * Query one channel info.
+   * 
+   * @param controller_id local controller number (1, 2, 3, ...)
+   * @param bus_num channel number (1, 2, 3, ...)
+   * @param out_buf info
+   */
+  bool get_channel_info(uint32_t controller_id, uint32_t bus_num, hpt::CHANNEL_INFO * out_buf);
+
+protected:
+
+};
+
+bool win32_highpoint_common::open_scsi(int n)
+{
+  // TODO: Use common open function for all devices using "\\.\ScsiN:"
+  char devpath[32];
+  snprintf(devpath, sizeof(devpath)-1, "\\\\.\\Scsi%d:", n);
+
+  HANDLE h = CreateFileA(devpath, GENERIC_READ|GENERIC_WRITE,
+    FILE_SHARE_READ|FILE_SHARE_WRITE,
+    (SECURITY_ATTRIBUTES *)0, OPEN_EXISTING, 0, 0);
+
+  if (h == INVALID_HANDLE_VALUE) {
+    long err = GetLastError();
+    if (scsi_debugmode > 1)
+      pout("  %s: Open failed, Error=%ld\n", devpath, err);
+    if (err == ERROR_FILE_NOT_FOUND)
+      set_err(ENOENT, "%s: not found", devpath);
+    else if (err == ERROR_ACCESS_DENIED)
+      set_err(EACCES, "%s: access denied", devpath);
+    else
+      set_err(EIO, "%s: Error=%ld", devpath, err);
+    return false;
+  }
+
+  if (scsi_debugmode > 1)
+    pout("  %s: successfully opened\n", devpath);
+
+  set_fh(h);
+  return true;  
+}
+
+bool win32_highpoint_common::hpt_ioctl(unsigned code, IOCTL_HEADER * ioctl_buffer,
+  unsigned ioctl_bufsiz)
+{
+  // Set header
+  ioctl_buffer->HeaderLength = sizeof(IOCTL_HEADER);
+  memcpy((char *)ioctl_buffer->Signature, "HPT-CTRL\0", sizeof(ioctl_buffer->Signature));
+  ioctl_buffer->Timeout = CSMI_SAS_TIMEOUT;
+  ioctl_buffer->ControlCode = HPT_CTL_CODE(code);
+  ioctl_buffer->ReturnCode = 0;
+  ioctl_buffer->Length = ioctl_bufsiz - sizeof(IOCTL_HEADER);
+
+  // Call function
+  DWORD num_out = 0;
+  if (!DeviceIoControl(get_fh(), IOCTL_SCSI_MINIPORT,
+    ioctl_buffer, ioctl_bufsiz, ioctl_buffer, ioctl_bufsiz, &num_out, (OVERLAPPED*)0)) {
+    long err = GetLastError();
+    if (scsi_debugmode)
+      pout("  IOCTL_SCSI_MINIPORT(HPT_CTL_CODE_%u) failed, Error=%ld\n", code, err);
+    if (   err == ERROR_INVALID_FUNCTION
+        || err == ERROR_NOT_SUPPORTED
+        || err == ERROR_DEV_NOT_EXIST)
+      return set_err(ENOSYS, "HPT command is not supported (Error=%ld)", err);
+    else
+      return set_err(EIO, "HPT command(%u) failed with Error=%ld", code, err);
+  }
+
+  // Check result
+  if (ioctl_buffer->ReturnCode) {
+    if (scsi_debugmode) {
+      pout("  IOCTL_SCSI_MINIPORT(HPT_CTL_CODE_%u) failed, ReturnCode=%u\n",
+        code, (unsigned)ioctl_buffer->ReturnCode);
+    }
+    return set_err(EIO, "HPT command(%u) failed with ReturnCode=%u", code, (unsigned)ioctl_buffer->ReturnCode);
+  }
+
+  if (scsi_debugmode > 1)
+    pout("  IOCTL_SCSI_MINIPORT(HPT_CTL_CODE_%u) succeeded, bytes returned: %u\n", code, (unsigned)num_out);
+
+  return true;
+}
+
+bool win32_highpoint_common::get_version(uint32_t & version)
+{
+  hpt::buffer_layouter buf(0, 4);
+
+  if (!hpt_ioctl(HPT_IOCTL_CODE_GET_VERSION, buf.ioctl_header(), buf.total_size())) {
+    return false;
+  }
+
+  typedef struct {
+    uint32_t version;
+  } out_format;
+
+  version = reinterpret_cast<out_format *>(buf.out_data())->version;
+  return true;
+}
+
+bool win32_highpoint_common::get_device_info(uint32_t device_id, hpt::LOGICAL_DEVICE_INFO * out_buf)
+{
+  hpt::buffer_layouter buf(4, sizeof(hpt::LOGICAL_DEVICE_INFO));
+
+  typedef struct {
+    uint32_t device_id;
+  } in_format;
+
+  reinterpret_cast<in_format *>(buf.in_data())->device_id = device_id;
+
+  if (!hpt_ioctl(HPT_IOCTL_CODE_GET_DEVICE_INFO, buf.ioctl_header(), buf.total_size())) {
+    return false;
+  }
+
+  memcpy(out_buf, buf.out_data(), sizeof(hpt::LOGICAL_DEVICE_INFO));
+  return true;
+}
+
+bool win32_highpoint_common::get_controller_info_v2(uint32_t controller_id, hpt::CONTROLLER_INFO_V2 * out_buf)
+{
+  hpt::buffer_layouter buf(4, sizeof(hpt::CONTROLLER_INFO_V2));
+
+  typedef struct {
+    uint32_t controller_id;
+  } in_format;
+
+  reinterpret_cast<in_format *>(buf.in_data())->controller_id = controller_id - 1;
+
+  if (!hpt_ioctl(HPT_IOCTL_CODE_GET_CONTROLLER_INFO_V2, buf.ioctl_header(), buf.total_size())) {
+    return false;
+  }
+
+  memcpy(out_buf, buf.out_data(), sizeof(hpt::CONTROLLER_INFO_V2));
+  return true;
+}
+
+bool win32_highpoint_common::get_channel_info(uint32_t controller_id, uint32_t bus_num, 
+  hpt::CHANNEL_INFO * out_buf)
+{
+  hpt::buffer_layouter buf(8, sizeof(hpt::CHANNEL_INFO));
+
+#pragma pack(push,1)
+  typedef struct {
+    uint32_t controller_id;
+    uint32_t bus_num;
+  } in_format;
+#pragma pack(pop)
+
+  reinterpret_cast<in_format *>(buf.in_data())->controller_id = controller_id - 1;
+  reinterpret_cast<in_format *>(buf.in_data())->bus_num = bus_num - 1;
+
+  if (!hpt_ioctl(HPT_IOCTL_CODE_GET_CHANNEL_INFO, buf.ioctl_header(), buf.total_size())) {
+    return false;
+  }
+
+  memcpy(out_buf, buf.out_data(), sizeof(hpt::CHANNEL_INFO));
+  return true;
+}
+
+//////////////////////////////////////////////////////////////////////
+// win32_highpoint_ata_device
+
+class win32_highpoint_ata_device
+: public /*implements*/ ata_device,
+  public /*extends*/ win32_highpoint_common
+{
+public:
+  win32_highpoint_ata_device(smart_interface * intf, 
+    const char * dev_name, const char * dev_type, unsigned int scsi_num, unsigned int device_id);
+
+  virtual bool open() override;
+
+  /**
+   * Send a HPT_IOCTL_IDE_PASS_THROUGH request.
+   */
+  virtual bool ata_pass_through(const ata_cmd_in & in, ata_cmd_out & out);
+  
+private:
+  unsigned int m_scsi_num;
+  unsigned int m_device_id;
+};
+
+win32_highpoint_ata_device::win32_highpoint_ata_device(smart_interface * intf,
+  const char * dev_name, const char * dev_type, unsigned int scsi_num, unsigned int device_id)
+: smart_device(intf, dev_name, dev_type, "")
+{
+  m_scsi_num = scsi_num;
+  m_device_id = device_id;
+  set_info().info_name = strprintf("%s", dev_name);
+}
+
+bool win32_highpoint_ata_device::open()
+{
+  if (!open_scsi(m_scsi_num))
+    return false;
+
+  uint32_t ver;
+  if (!get_version(ver)) {
+    close();
+    return false;
+  }
+
+  return true;
+}
+
+bool win32_highpoint_ata_device::ata_pass_through(const ata_cmd_in & in, ata_cmd_out & out)
+{
+  const bool will_read = in.direction == ata_cmd_in::data_in;
+  const bool will_write = in.direction == ata_cmd_in::data_out;
+
+  const size_t bytes_in_data = will_write ? in.size : 0;
+  const size_t bytes_out_data = will_read ? in.size : 0;
+
+  hpt::buffer_layouter blk(
+    sizeof(hpt::IDE_PASS_THROUGH_HEADER) + bytes_in_data,
+    sizeof(hpt::IDE_PASS_THROUGH_HEADER) + bytes_out_data
+  );
+
+  if (!blk.allocated()) {
+    return smart_device::set_err(ENOMEM, "buffer allocation failure");
+  }
+
+  hpt::IDE_PASS_THROUGH_HEADER * ata_in = reinterpret_cast<hpt::IDE_PASS_THROUGH_HEADER *>(blk.in_data());
+
+  void *user_data_in = &ata_in[1];
+
+  hpt::IDE_PASS_THROUGH_HEADER * ata_out = reinterpret_cast<hpt::IDE_PASS_THROUGH_HEADER *>(blk.out_data());
+
+  void *user_data_out = &ata_out[1];
+ 
+  ata_in->id_disk = m_device_id;
+  ata_in->features_reg = in.in_regs.features;
+  ata_in->sector_count_reg = in.in_regs.sector_count;
+  ata_in->lba_low_reg = in.in_regs.lba_low;
+  ata_in->lba_mid_reg = in.in_regs.lba_mid;
+  ata_in->lba_high_reg = in.in_regs.lba_high;
+  ata_in->drive_head_reg = in.in_regs.device;
+  ata_in->command_reg = in.in_regs.command;
+  ata_in->sectors = in.in_regs.sector_count;
+  ata_in->protocol =
+    will_read ? IO_COMMAND_READ :
+    will_write ? IO_COMMAND_WRITE :
+    0;
+ 
+  memcpy(user_data_in, in.buffer, bytes_in_data);
+ 
+  if (!hpt_ioctl(HPT_IOCTL_CODE_IDE_PASS_THROUGH, blk.ioctl_header(), blk.total_size())) {
+    return false;
+  }
+  
+  ata_out_regs_48bit &r = out.out_regs;
+  r.error           = ata_out->features_reg;
+  r.sector_count_16 = ata_out->sector_count_reg;
+  r.lba_low_16      = ata_out->lba_low_reg;
+  r.lba_mid_16      = ata_out->lba_mid_reg;
+  r.lba_high_16     = ata_out->lba_high_reg;
+  r.device          = ata_out->drive_head_reg;
+  r.status          = ata_out->command_reg;
+
+  memcpy(in.buffer, user_data_out, bytes_out_data);
+
+  return true;
+}
+
+//////////////////////////////////////////////////////////////////////
+// win32_highpoint_sas_device
+
+class win32_highpoint_sas_device
+: public /*implements*/ scsi_device,
+  public /*extends*/ win32_highpoint_common
+{
+public:
+  win32_highpoint_sas_device(smart_interface * intf, 
+    const char * dev_name, const char * dev_type , unsigned int scsi_num, unsigned int device_id);
+
+  virtual bool open() override;
+
+  /**
+   * Send a HPT_IOCTL_SCSI_PASS_THROUGH request.
+   */
+  virtual bool scsi_pass_through(struct scsi_cmnd_io *iop);
+
+private:
+  unsigned int m_scsi_num;
+  unsigned int m_device_id;
+};
+
+win32_highpoint_sas_device::win32_highpoint_sas_device(smart_interface * intf,
+  const char * dev_name, const char * dev_type, unsigned int scsi_num, unsigned int device_id)
+: smart_device(intf, dev_name, dev_type, "")
+{
+  m_scsi_num = scsi_num;
+  m_device_id = device_id;
+  set_info().info_name = strprintf("%s", dev_name);
+}
+
+bool win32_highpoint_sas_device::open()
+{
+  if (!open_scsi(m_scsi_num))
+    return false;
+
+  uint32_t ver;
+  if (!get_version(ver)) {
+    close();
+    return false;
+  }
+
+  return true;
+}
+
+bool win32_highpoint_sas_device::scsi_pass_through(struct scsi_cmnd_io *iop)
+{
+  const bool will_read = iop->dxfer_dir == DXFER_FROM_DEVICE;
+  const bool will_write = iop->dxfer_dir == DXFER_TO_DEVICE;
+ 
+  const size_t bytes_in_data = will_write?iop->dxfer_len:0;
+  const size_t bytes_out_data = will_read?iop->dxfer_len:0;
+ 
+  hpt::buffer_layouter blk(
+    sizeof(hpt::SCSI_PASS_THROUGH_IN) + bytes_in_data,
+    sizeof(hpt::SCSI_PASS_THROUGH_OUT) + bytes_out_data
+  );
+
+  if (!blk.allocated()) {
+    return smart_device::set_err(ENOMEM, "buffer allocation failure");
+  }
+
+  hpt::SCSI_PASS_THROUGH_IN * scsi_in = reinterpret_cast<hpt::SCSI_PASS_THROUGH_IN *>(blk.in_data());
+
+  void *user_data_in = &scsi_in[1];
+
+  hpt::SCSI_PASS_THROUGH_OUT * scsi_out = reinterpret_cast<hpt::SCSI_PASS_THROUGH_OUT *>(blk.out_data());
+
+  void *user_data_out = &scsi_out[1];
+ 
+  scsi_in->id_disk = m_device_id;
+  scsi_in->protocol =
+    will_read ? IO_COMMAND_READ :
+    will_write ? IO_COMMAND_WRITE :
+    0;
+  scsi_in->cdb_length = iop->cmnd_len;
+  memcpy(scsi_in->cdb, iop->cmnd, iop->cmnd_len);
+  scsi_in->data_length = iop->dxfer_len;
+ 
+  memcpy(user_data_in, iop->dxferp, bytes_in_data);
+
+  if (!hpt_ioctl(HPT_IOCTL_CODE_SCSI_PASS_THROUGH, blk.ioctl_header(), blk.total_size())) {
+    return false;
+  }
+
+  memcpy(iop->dxferp, user_data_out, bytes_out_data);
+   
+  iop->scsi_status = scsi_out->scsi_status;
+  iop->resp_sense_len = scsi_out->data_length;
+  iop->resid = 0;
+ 
+  return true;
+}
+
+//////////////////////////////////////////////////////////////////////
+// hpt::helper
+
+namespace hpt::helper
+{
+  typedef enum {
+    ata = 0x01,
+    sas = 0x02,
+    array = 0x04,
+
+    harddisk = 0x10,
+    cdrom = 0x20,
+    tape = 0x30,
+
+    raid0 = 0x0100,
+    raid1 = 0x0200,
+    raid5 = 0x0300,
+    raid6 = 0x0400,
+    raid3 = 0x0500,
+    raid4 = 0x0600,
+    jbod = 0x0700,
+    raid1e = 0x0800,
+  } device_mask;
+
+  typedef struct {
+    uint32_t cross_hba_controller_id;
+
+    uint32_t controller_id;
+    uint32_t channel;
+    uint32_t disknum;
+
+    uint32_t scsi_num;
+    uint32_t device_id;
+
+    uint32_t dev_mask;
+
+    char dev_name[16]; // "/dev/scsi0c1"
+    char dev_type[16]; // "hpt,L/M/N"
+  } found_device;
+
+  typedef std::vector<found_device> found_device_list;
+
+  void detect_devices(
+    smart_interface * intf,
+    found_device_list & out_list
+  )
+  {
+    uint32_t cross_hba_controller_id = 1;
+
+    for (uint32_t scsi_num = 0; ; scsi_num++) {
+      win32_highpoint_ata_device test_dev(intf, "", "", scsi_num, 0);
+      if (!test_dev.open()) {
+        if (test_dev.get_errno() == ENOENT) {
+          break;
+        }
+        else {
+          if (scsi_debugmode > 1) {
+            pout("  hpt: scsi_num %u is not a RocketRAID HBA\n", scsi_num);
+          }
+          continue;
+        }
+      }
+      
+      for (uint32_t controller_id = 1; ; controller_id++, cross_hba_controller_id++) {
+        CONTROLLER_INFO_V2 ctrl_info;
+        if (!test_dev.get_controller_info_v2(controller_id, &ctrl_info)) {
+          if (scsi_debugmode > 1) {
+            pout("  hpt: scsi_num %u controller_id %u is not available\n", scsi_num, controller_id);
+          }
+          break;
+        }
+
+        for (uint32_t channel = 1; ; channel++) {
+          CHANNEL_INFO chan_info;
+          if (!test_dev.get_channel_info(controller_id, channel, &chan_info)) {
+            if (scsi_debugmode > 1) {
+              pout("  hpt: scsi_num %u controller_id %u channel %u is not available\n"
+                , scsi_num, controller_id, channel);
+            }
+            break;
+          }
+
+          for (uint32_t disknum = 1; disknum <= 2; disknum++) {
+            const uint32_t device_id = chan_info.devices[disknum - 1];
+            if (device_id == 0) {
+              // no device is connected.
+              continue;
+            }
+
+            LOGICAL_DEVICE_INFO dev_info;
+            if (!test_dev.get_device_info(device_id, &dev_info)) {
+              continue;
+            }
+
+            found_device found;
+            found.cross_hba_controller_id = cross_hba_controller_id;
+
+            found.controller_id = controller_id;
+            found.channel = channel;
+            found.disknum = disknum;
+
+            found.scsi_num = scsi_num;
+            found.device_id = device_id;
+
+            found.dev_mask = 0;
+
+            snprintf(found.dev_name, sizeof(found.dev_name)
+              , "/dev/scsi%ud%u"
+              , scsi_num, device_id);
+
+            snprintf(found.dev_type, sizeof(found.dev_type)
+              , "hpt,%u/%u/%u"
+              , cross_hba_controller_id, channel, disknum);
+
+            switch (dev_info.type) {
+              case LDT_DEVICE:
+                {
+                  // sata device: DEVICE_FLAG_SATA
+                  // sas device:  DEVICE_FLAG_SATA|DEVICE_FLAG_SAS
+
+                  if (dev_info.un.device.flags & DEVICE_FLAG_SAS) {
+                    found.dev_mask |= device_mask::sas;
+                  }
+                  else if (dev_info.un.device.flags & DEVICE_FLAG_SATA) {
+                    found.dev_mask |= device_mask::ata;
+                  }
+
+                  found.dev_mask |= (dev_info.un.device.device_type & 0xF) << 4; // PDT_HARDDISK and so on.
+                  break;
+                }
+              case LDT_ARRAY:
+                {
+                  found.dev_mask |= device_mask::array;
+
+                  found.dev_mask |= (dev_info.un.array.array_type & 0xFF) << 8; // AT_RAID0 and so on.
+                  break;
+                }
+            }
+
+            out_list.push_back(found);
+
+            if (scsi_debugmode > 1) {
+              std::string desc = "unknown device";
+              {
+                if (found.dev_mask & device_mask::sas) {
+                  desc = "sas";
+                }
+                else if (found.dev_mask & device_mask::ata) {
+                  desc = "ata";
+                }
+                else if (found.dev_mask & device_mask::array) {
+                  if (found.dev_mask & raid0) desc += "raid0";
+                  if (found.dev_mask & raid1) desc += "raid1";
+                  if (found.dev_mask & raid5) desc += "raid5";
+                  if (found.dev_mask & raid6) desc += "raid6";
+                  if (found.dev_mask & raid3) desc += "raid3";
+                  if (found.dev_mask & raid4) desc += "raid4";
+                  if (found.dev_mask & jbod) desc += "jbod";
+                  if (found.dev_mask & raid1e) desc += "raid1e";
+                  else desc += "unknown";
+
+                  desc += " array";
+                }
+                else {
+                  desc = "unknown";
+                }
+
+                if (found.dev_mask & device_mask::harddisk) desc += " harddisk";
+                else if (found.dev_mask & device_mask::cdrom) desc += " cdrom";
+                else if (found.dev_mask & device_mask::tape) desc += " tape";
+                else desc = "unknown";
+
+                desc += " device";
+              }
+
+              pout("  hpt: %s found hpt,%u/%u/%u (scsi_num %u device_id %u device_mask %08x)\n"
+                , desc.c_str()
+                , cross_hba_controller_id, channel, disknum
+                , scsi_num, device_id, found.dev_mask
+              );
+            }
+
+          }
+        }
+      }
+    }
+  }
+
+  smart_device * find_device(
+    smart_interface * intf, 
+    const uint32_t controller,
+    const uint32_t channel,
+    const uint32_t disknum
+  )
+  {
+    found_device_list list;
+    list.reserve(16);
+
+    detect_devices(intf, list);
+
+    found_device_list::iterator iter = list.begin();
+    for (; iter != list.end(); iter++) {
+      if (true
+        && iter->cross_hba_controller_id == controller
+        && iter->channel == channel
+        && iter->disknum == disknum
+      )
+      {
+        if (iter->dev_mask & device_mask::sas) {
+          return new win32_highpoint_sas_device(intf,
+            iter->dev_name, iter->dev_type, iter->scsi_num, iter->device_id);
+        }
+        else if (iter->dev_mask & device_mask::ata) {
+          return new win32_highpoint_ata_device(intf,
+            iter->dev_name, iter->dev_type, iter->scsi_num, iter->device_id);
+        }
+        return nullptr;
+      }
+    }
+    return nullptr;
+  }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // win_smart_interface
 // Platform specific interface
@@ -4340,12 +4981,41 @@ smart_device * win_smart_interface::get_custom_smart_device(const char * name, c
     return 0;
   }
 
+  // Highpoint ?
+  int controller = -1, channel = -1; disknum = 1;
+  n1 = n2 = -1; int n3 = -1;
+  if (sscanf(type, "hpt,%n%d/%d%n/%d%n", &n1, &controller, &channel, &n2, &disknum, &n3) >= 2 || n1 == 4) {
+    int len = strlen(type);
+    if (!(n2 == len || n3 == len)) {
+      set_err(EINVAL, "Option '-d hpt,L/M/N' supports 2-3 items");
+      return 0;
+    }
+    if (!(1 <= controller && controller <= 8)) {
+      set_err(EINVAL, "Option '-d hpt,L/M/N' invalid controller id L supplied");
+      return 0;
+    }
+    if (!(1 <= channel && channel <= 128)) {
+      set_err(EINVAL, "Option '-d hpt,L/M/N' invalid channel number M supplied");
+      return 0;
+    }
+    if (!(1 <= disknum && disknum <= 15)) {
+      set_err(EINVAL, "Option '-d hpt,L/M/N' invalid pmport number N supplied");
+      return 0;
+    }
+    smart_device * device_found = hpt::helper::find_device(
+      this, controller, channel, disknum);
+    if (!device_found) {
+      return 0;
+    }
+    return device_found;
+  }
+
   return 0;
 }
 
 std::string win_smart_interface::get_valid_custom_dev_types_str()
 {
-  return "aacraid,H,L,ID, areca,N[/E]";
+  return "aacraid,H,L,ID, areca,N[/E], hpt,L/M/N";
 }
 
 
@@ -4586,9 +5256,9 @@ bool win_smart_interface::scan_smart_devices(smart_device_list & devlist,
   }
 
   // Set valid types
-  bool ata, scsi, sat, usb, csmi, nvme;
+  bool ata, scsi, sat, usb, csmi, nvme, hpt;
   if (!type) {
-    ata = scsi = usb = sat = csmi = true;
+    ata = scsi = usb = sat = csmi = hpt = true;
 #ifdef WITH_NVME_DEVICESCAN // TODO: Remove when NVMe support is no longer EXPERIMENTAL
     nvme = true;
 #else
@@ -4596,7 +5266,7 @@ bool win_smart_interface::scan_smart_devices(smart_device_list & devlist,
 #endif
   }
   else {
-    ata = scsi = usb = sat = csmi = nvme = false;
+    ata = scsi = usb = sat = csmi = nvme = hpt = false;
     if (!strcmp(type, "ata"))
       ata = true;
     else if (!strcmp(type, "scsi"))
@@ -4609,17 +5279,19 @@ bool win_smart_interface::scan_smart_devices(smart_device_list & devlist,
       csmi = true;
     else if (!strcmp(type, "nvme"))
       nvme = true;
+    else if (!strcmp(type, "hpt"))
+      hpt = true;
     else {
       set_err(EINVAL,
               "Invalid type '%s', valid arguments are: ata[,pd], scsi[,pd], "
-              "sat[,pd], usb[,pd], csmi, nvme, pd", type);
+              "sat[,pd], usb[,pd], csmi, nvme, pd, hpt", type);
       return false;
     }
   }
 
   char name[32];
 
-  if (ata || scsi || sat || usb || nvme) {
+  if (ata || scsi || sat || usb || nvme || hpt) {
     // Scan up to 128 drives and 2 3ware controllers
     const int max_raid = 2;
     bool raid_seen[max_raid] = {false, false};
@@ -4747,6 +5419,31 @@ bool win_smart_interface::scan_smart_devices(smart_device_list & devlist,
       devlist.push_back( new win_nvme_device(this, name, "nvme", 0) );
     }
   }
+
+  if (hpt) {
+    hpt::helper::found_device_list list;
+    list.reserve(16);
+
+    hpt::helper::detect_devices(this, list);
+
+    hpt::helper::found_device_list::iterator iter = list.begin();
+
+    for (; iter != list.end(); iter++) {
+      if (iter->dev_mask & hpt::helper::device_mask::sas) {
+        devlist.push_back(
+          new win32_highpoint_sas_device(
+            this, iter->dev_name, iter->dev_type, iter->scsi_num, iter->device_id)
+        );
+      }
+      else if (iter->dev_mask & hpt::helper::device_mask::ata) {
+        devlist.push_back(
+          new win32_highpoint_ata_device(
+            this, iter->dev_name, iter->dev_type, iter->scsi_num, iter->device_id)
+        );
+      }
+    }
+  }
+
   return true;
 }
 
